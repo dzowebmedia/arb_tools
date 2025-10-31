@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+outputs/
+outputs_rpc/
+expansions/
+expansions_rpc/
+*.parquet
+*.csv
+*.tmp

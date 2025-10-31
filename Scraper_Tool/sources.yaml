@@ -1,0 +1,21 @@
+sources:
+  - name: nbcnews
+    url: https://www.nbcnews.com
+  - name: businessinsider
+    url: https://www.businessinsider.com/
+  - name: slate
+    url: https://slate.com/
+  - name: msnbc
+    url: https://www.msnbc.com
+  - name: marketwatch
+    url: https://www.marketwatch.com
+  - name: cnn
+    url: https://www.cnn.com
+  - name: foxnews
+    url: https://www.foxnews.com
+  - name: usatoday
+    url: https://www.usatoday.com
+  - name: weather
+    url: https://weather.com/
+
+  
