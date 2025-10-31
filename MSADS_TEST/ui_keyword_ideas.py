@@ -287,15 +287,20 @@ def get_device_kpis_rest(access_token, developer_token, account_id, customer_id,
                     }
     return out
 
-def _map_kpi_interval(val: str) -> str:
-v = (val or “”).strip()
-if v in (“LastWeek”,“LastMonth”,“LastDay”):
-return v
-if v in (“Last7Days”,):
-return “LastWeek”
-if v in (“Last30Days”,“Last3Months”):
-return “LastMonth”
-return “LastMonth”
+def _clean_str(val: str | None) -> str:
+    v = (val or "").strip()
+    return v
+
+def _map_kpi_interval(ui_value: str) -> str:
+    ui_value = (ui_value or "").strip()
+    if ui_value in {"LastWeek", "LastMonth", "LastDay"}:
+        return ui_value
+    return {
+        "Last7Days": "LastWeek",
+        "Last30Days": "LastMonth",
+        "LastMonth": "LastMonth",
+        "Last3Months": "LastMonth",
+    }.get(ui_value, "LastMonth")
 
 # ---------- Geo file (v3.0) ----------
 @st.cache_data(show_spinner=False, ttl=3600)
