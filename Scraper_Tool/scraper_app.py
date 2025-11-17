@@ -29,9 +29,20 @@ def same_host(u1: str, u2: str) -> bool:
 
 # tracker/portal domains we don't want as FINAL destinations
 _TRACKER_HOSTS = {
+    # generic trackers
     "adclick.g.doubleclick.net",
     "googleadservices.com",
     "googlesyndication.com",
+    # Taboola click domains
+    "taboola.com",
+    "trc.taboola.com",
+    "cdn.taboola.com",
+    "api.taboola.com",
+    # Outbrain click domains
+    "outbrain.com",
+    "paid.outbrain.com",
+    "ch.outbrain.com",
+    "click.outbrain.com",
 }
 
 def is_external_ad(url: str, src_url: str) -> bool:
@@ -58,14 +69,14 @@ EXPORTS_DIR = os.path.join(os.getcwd(), "exports")
 os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 # Tuning knobs for reliability/speed
-RESOLVE_DEST_URL = True           # follow redirects selectively (see should_resolve)
-GOTO_TIMEOUT_MS = 35000           # page.goto timeout per site
-SCROLL_STEPS = 8                  # how many scrolls to trigger lazy-load
-SCROLL_SLEEP_S = 1.2              # delay between scrolls
-POST_INJECT_WAIT_S = 2.5          # wait after scrolling for Taboola/Outbrain to inject
-SITE_DEADLINE_S = 60              # hard per-site watchdog (skip site if it exceeds this)
-MAX_CONTAINERS = 16               # cap how many native containers per site
-MAX_LINKS_PER_CONTAINER = 40      # cap links per container
+RESOLVE_DEST_URL = True            # follow redirects selectively (see should_resolve)
+GOTO_TIMEOUT_MS = 45000            # page.goto timeout per site
+SCROLL_STEPS = 14                  # more scrolls so IntersectionObserver triggers
+SCROLL_SLEEP_S = 1.0               # a little faster
+POST_INJECT_WAIT_S = 3.5           # give Taboola some breathing room
+SITE_DEADLINE_S = 150              # per-site watchdog
+MAX_CONTAINERS = 20
+MAX_LINKS_PER_CONTAINER = 50
 
 # --------------------------------------------------
 # Utility Functions
@@ -212,201 +223,412 @@ def recurrence_table(files, column_name, keyword):
     return pivot.sort_values("Total", ascending=False)
 
 # --------------------------------------------------
-# Native Ad Scan Logic
+# Native helpers (define BEFORE async_run_native_scan)
 # --------------------------------------------------
+def _host(u: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        return urlparse(u).netloc.lower().lstrip("www.")
+    except Exception:
+        return ""
+
+def same_host(u1: str, u2: str) -> bool:
+    h1, h2 = _host(u1), _host(u2)
+    return bool(h1) and bool(h2) and (h1.endswith(h2) or h2.endswith(h1))
+
+_TRACKER_HOSTS = {
+    "adclick.g.doubleclick.net",
+    "googleadservices.com",
+    "googlesyndication.com",
+}
+
+def is_external_ad(url: str, src_url: str) -> bool:
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    if same_host(url, src_url):
+        return False
+    return True
+
+def should_resolve(url: str) -> bool:
+    h = _host(url)
+    if not h:
+        return False
+    if h in _TRACKER_HOSTS or "yhs/r" in url:
+        return True
+    return False
+
+# --------------------------------------------------
+# Native Ad Scan Logic (clean)
+# --------------------------------------------------
+
 def detect_ad_network_from_html(html_low: str) -> str:
-    if "taboola" in html_low or "data-taboola" in html_low:
+    if not html_low:
+        return "Unknown"
+    if ("taboola" in html_low) or ("data-taboola" in html_low):
         return "Taboola"
-    if "outbrain" in html_low or "ob-widget" in html_low or "data-ob" in html_low:
+    if ("outbrain" in html_low) or ("ob-widget" in html_low) or ("data-ob" in html_low):
         return "Outbrain"
     return "Unknown"
 
 def _clean_text(raw: str) -> str:
-    # normalize all whitespace to single spaces; strip ad boilerplate
     txt = re.sub(r"\s+", " ", (raw or "")).strip()
     txt = re.sub(r"(?i)\b(SPONSORED|Sponsored|Ad|Ads|Search ads ?/?|Learn More)\b", "", txt)
     txt = txt.replace("| |", "|").strip(" -:|").strip()
     return txt
 
 def _split_brand_headline_desc(text_cleaned: str):
-    """Legacy-style, robust splitter with guardrails so a long headline doesn't become 'brand'."""
     brand, headline, desc = "", "", ""
-
-    # prefer separators if they look brandlike on the left
     if " | " in text_cleaned or " / " in text_cleaned:
         sep = " | " if " | " in text_cleaned else " / "
         parts = [p.strip() for p in text_cleaned.split(sep) if p.strip()]
         if len(parts) >= 2:
             left, right = parts[0], parts[1]
-            # left is brand only if reasonably short (≤ 28 chars, ≤ 4 words)
             if len(left) <= 28 and len(left.split()) <= 4:
                 brand, headline = left, right
                 if len(parts) > 2:
                     desc = " ".join(parts[2:])
             else:
-                # left is actually headline; keep rest as desc
                 headline = left
                 if len(parts) > 1:
                     desc = " ".join(parts[1:])
     elif " - " in text_cleaned:
         p = text_cleaned.split(" - ", 1)
+        headline = p[0].strip()
         if len(p) == 2:
-            headline, desc = p[0].strip(), p[1].strip()
-        else:
-            headline = text_cleaned
+            desc = p[1].strip()
     else:
         headline = text_cleaned
 
-    # punctuation-based fallback to get desc if missing
     if not desc:
         m = re.match(r"^(.*?[.!?])\s+(.*)$", headline)
         if m:
             headline, desc = m.group(1).strip(), m.group(2).strip()
-
     return brand.strip(), headline.strip(), desc.strip()
+
+def _looks_like_article(href: str) -> bool:
+    if not href:
+        return False
+    href = href.lower()
+    return href.startswith(("http://","https://")) and any(p in href for p in [
+        "/news/","/politics/","/tech/","/business/","/health/","/sports/","/us-news/"
+    ])
+
+async def _collect_article_links(page, limit=6):
+    links = []
+    try:
+        as_ = page.locator('a[href*="/news/"], a[href*="/us-news/"], a[href*="/politics/"]')
+        count = await as_.count()
+        for i in range(min(count, 60)):
+            href = await as_.nth(i).get_attribute("href")
+            if not href:
+                continue
+            if href.startswith("/"):
+                href = urljoin(page.url, href)
+            if _looks_like_article(href):
+                links.append(href)
+            if len(links) >= limit:
+                break
+    except Exception:
+        pass
+    return links
+
+TABOOLA_CONTAINER_SELECTORS = [
+    '[id*="taboola"]','[class*="taboola"]','div[id^="taboola-"]','[data-taboola]',
+    'iframe[src*="taboola"]','iframe[name*="taboola"]',
+]
+OUTBRAIN_CONTAINER_SELECTORS = [
+    '[id*="outbrain"]','[class*="outbrain"]','div[class^="OUTBRAIN"]',
+    '[data-ob-widget]','[data-ob-template]',
+    'iframe[src*="outbrain"]','iframe[name*="outbrain"]',
+]
+GENERIC_NATIVE_SELECTORS = [
+    'div.trc_rbox_container','div.trc-content-sponsored',
+    'div:has(a[href*="taboola.com"])','div:has(a[href*="outbrain.com"])',
+]
+CONTAINER_CSS = ", ".join(TABOOLA_CONTAINER_SELECTORS + OUTBRAIN_CONTAINER_SELECTORS + GENERIC_NATIVE_SELECTORS)
+
+async def _dismiss_gdpr(page):
+    sels = [
+        "#onetrust-accept-btn-handler",
+        "button#onetrust-accept-btn-handler",
+        "button:has-text('Accept All')",
+        "button:has-text('I Agree')",
+        "button:has-text('Continue')",
+    ]
+    for s in sels:
+        try:
+            loc = page.locator(s)
+            if await loc.count():
+                await loc.first.click(timeout=2500)
+                break
+        except Exception:
+            continue
+
+async def _reliably_wait_for_taboola(page):
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    await _dismiss_gdpr(page)
+    try:
+        await page.wait_for_selector(
+            ",".join([
+                '[id*="taboola"]','[class*="taboola"]','div[id^="taboola-"]','[data-taboola]',
+                '[id*="outbrain"]','[class*="outbrain"]','div[class^="OUTBRAIN"]','[data-ob-widget]',
+                'iframe[src*="taboola"]','iframe[name*="taboola"]',
+                'iframe[src*="outbrain"]','iframe[name*="outbrain"]',
+            ]),
+            timeout=20000
+        )
+    except Exception:
+        pass
+
+async def _find_native_containers(page):
+    containers = await page.locator(CONTAINER_CSS).all()
+    # scan ad iframes whose URL or name hints Taboola/Outbrain
+    for fr in page.frames:
+        if fr is page.main_frame:
+            continue
+        tag = (fr.url or "").lower() + "|" + (fr.name or "").lower()
+        if any(t in tag for t in ("taboola","outbrain","trc.")):
+            try:
+                containers += await fr.locator(CONTAINER_CSS).all()
+            except Exception:
+                pass
+    return containers
 
 async def async_run_native_scan(output_file):
     DATE_SEEN = date.today().isoformat()
 
     with open("sources.yaml", "r") as f:
         sources = yaml.safe_load(f).get("sources", [])
+    if not sources:
+        st.warning("sources.yaml is empty — add at least one source URL")
+        return
 
     all_rows = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6_1) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            bypass_csp=True,
+            java_script_enabled=True,
+            viewport={"width": 1366, "height": 900},
+            timezone_id="America/Los_Angeles",
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            "try{localStorage.setItem('OptanonConsent','isIABGlobal=false&datestamp=1');}catch(e){}"
+        )
 
-        # Block heavy assets but allow scripts so Taboola/Outbrain can inject
-        async def _block(route):
+        async def _route_generic(route):
             r = route.request
-            if r.resource_type in {"image", "stylesheet", "font"}:
-                await route.abort()
+            url_low = (r.url or "").lower()
+            if "nbcnews.com" in url_low:
+                if r.resource_type in {"font"}:
+                    return await route.abort()
+                return await route.continue_()
             else:
-                await route.continue_()
+                if r.resource_type in {"image","font"}:
+                    return await route.abort()
+                return await route.continue_()
 
-        await context.route("**/*", _block)
+        await context.route("**/*", _route_generic)
 
         async def _scan_one_site(src):
             url = src["url"]
             name = src.get("name", _host(url)) or _host(url)
-            st.write(f"🌐 Scanning: {url}")
+            st.write(f"Scanning: {url}")
 
             page = await context.new_page()
+            kept = 0
             try:
-                await page.goto(url, timeout=GOTO_TIMEOUT_MS)
+                # pass 1 — homepage
+                await page.goto(url, timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+                await _reliably_wait_for_taboola(page)
 
-                # trigger lazy-load
+                # lazy-load scroll
                 for _ in range(SCROLL_STEPS):
-                    await page.mouse.wheel(0, 1000)
+                    await page.mouse.wheel(0, 1200)
                     await asyncio.sleep(SCROLL_SLEEP_S)
                 await asyncio.sleep(POST_INJECT_WAIT_S)
 
-                selectors = [
-                    '[id*="taboola"]', '[class*="taboola"]', '[id*="outbrain"]', '[class*="outbrain"]',
-                    '[data-ob-widget]', '[data-type*="sponsored"]', 'div[data-ads*="true"]',
-                    'div:has(a[href*="taboola.com"])', 'div:has(a[href*="outbrain.com"])',
-                    '[data-taboola]', '[data-ob-template]', 'div[id^="taboola-"]', 'div[class^="OUTBRAIN"]',
-                ]
-                container_css = ", ".join(selectors)
+                containers = await _find_native_containers(page)
 
-                # find containers in main doc and iframes
-                containers = await page.locator(container_css).all()
-                for fr in page.frames:
-                    if fr != page.main_frame:
-                        containers += await fr.locator(container_css).all()
+                # NBC drilldown if nothing yet
+                if not containers and _host(url) == "nbcnews.com":
+                    links = await _collect_article_links(page, limit=6)
+                    st.write(f"NBC drilldown: {len(links)} article candidates")
+                    for art in links:
+                        try:
+                            await page.goto(art, timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+                            await _reliably_wait_for_taboola(page)
+                            for _ in range(6):
+                                await page.mouse.wheel(0, 1400)
+                                await asyncio.sleep(0.9)
+                            await asyncio.sleep(2.0)
+                            containers = await _find_native_containers(page)
+                            if containers:
+                                st.write(f"Found native containers on article: {art}")
+                                break
+                        except Exception as e:
+                            st.write(f"Drilldown article failed: {e}")
+                            continue
 
-                st.write(f"🔎 {name}: found {len(containers)} potential native ad containers")
+                # gentle reload retry if still empty
+                if not containers:
+                    try:
+                        await page.reload(timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+                        await _reliably_wait_for_taboola(page)
+                        for _ in range(6):
+                            await page.mouse.wheel(0, 1400)
+                            await asyncio.sleep(0.9)
+                        await asyncio.sleep(2.0)
+                        containers = await _find_native_containers(page)
+                    except Exception:
+                        pass
+
+                st.write(f"{name}: found {len(containers)} native containers")
                 containers = containers[:MAX_CONTAINERS]
 
                 seen = set()
-                kept = 0
 
                 for el in containers:
-                    # identify probable network
                     try:
                         html_chunk = await el.evaluate("(n) => n.outerHTML")
                     except Exception:
                         html_chunk = ""
                     network = detect_ad_network_from_html((html_chunk or "").lower())
 
-                    # links inside this container
                     link_loc = el.locator("a[href]")
                     link_count = min(await link_loc.count(), MAX_LINKS_PER_CONTAINER)
 
                     for idx in range(link_count):
                         link = link_loc.nth(idx)
                         href = (await link.get_attribute("href")) or ""
+                        if href.startswith("//"):
+                            href = "https:" + href
                         if not is_external_ad(href, url):
                             continue
 
-                        # text content — normalize whitespace early
-                        try:
-                            raw_text = await link.inner_text()
-                        except Exception:
-                            raw_text = await link.evaluate("(n) => (n.textContent || '')")
-                        text = _clean_text(raw_text)
+                        # attribute-aware extraction
+                        headline = ""
+                        brand = ""
+                        desc = ""
+                        image_url = ""
 
-                        # guard rails on length
-                        if not text or len(text) < 25 or len(text) > 220:
+                        for attr in ("data-item-title","aria-label","title"):
+                            v = await link.get_attribute(attr)
+                            if v and v.strip():
+                                headline = v.strip()
+                                break
+
+                        if not headline:
+                            try:
+                                parent = await link.evaluate_handle(
+                                    "(n)=>n.closest('[data-item-title],[data-brand],[data-description]')"
+                                )
+                                if parent:
+                                    for attr in ("data-item-title","aria-label","title"):
+                                        v = await parent.get_attribute(attr)  # type: ignore
+                                        if v and v.strip():
+                                            headline = v.strip()
+                                            break
+                            except Exception:
+                                pass
+
+                        if not headline:
+                            try:
+                                raw_text = await link.inner_text()
+                            except Exception:
+                                raw_text = await link.evaluate("(n) => (n.textContent || '')")
+                            headline = _clean_text(raw_text)
+
+                        for attr in ("data-brand","data-publisher"):
+                            v = await link.get_attribute(attr)
+                            if v and v.strip():
+                                brand = v.strip()
+                                break
+
+                        for attr in ("data-description","data-item-description"):
+                            v = await link.get_attribute(attr)
+                            if v and v.strip():
+                                desc = v.strip()
+                                break
+
+                        img = link.locator("img").first
+                        try:
+                            if await img.count():
+                                image_url = await img.get_attribute("src") or ""
+                                if not image_url:
+                                    image_url = await img.get_attribute("data-src") or ""
+                                if not image_url:
+                                    srcset = await img.get_attribute("srcset") or ""
+                                    if srcset:
+                                        image_url = srcset.split(",")[0].split()[0]
+                        except Exception:
+                            image_url = ""
+
+                        if not headline or len(headline) < 8:
+                            combined = " ".join([brand, headline or "", desc or ""]).strip()
+                            if not combined:
+                                try:
+                                    combined = await link.inner_text()
+                                except Exception:
+                                    combined = await link.evaluate("(n) => (n.textContent || '')")
+                            b2, h2, d2 = _split_brand_headline_desc(_clean_text(combined))
+                            brand = brand or b2
+                            headline = headline or h2
+                            desc = desc or d2
+
+                        headline = re.sub(r"\s+", " ", headline or "").strip()
+                        desc = re.sub(r"\s+", " ", (desc or "")).strip()
+                        if not headline or len(headline) < 12 or len(headline.split()) < 2:
+                            continue
+                        if headline.lower() in {"ad","sponsored","ad ad"}:
                             continue
 
-                        # de-dupe
-                        key = f"{text}||{href}"
+                        cta_text = ""
+                        for w in ("See","Discover","Search","Take","Learn","Explore","Read"):
+                            if re.search(rf"\b{w}\b", f"{headline} {desc}", re.IGNORECASE):
+                                cta_text = w
+                                break
+
+                        if same_host(href, url) and not cta_text and not desc:
+                            continue
+
+                        key = f"{headline}||{href}"
                         if key in seen:
                             continue
                         seen.add(key)
 
-                        # image (best-effort; we don't block functionality if missing)
-                        image_url = ""
-                        img = link.locator("img").first
-                        try:
-                            if await img.count():
-                                image_url = (await img.get_attribute("src")) or ""
-                        except Exception:
-                            image_url = ""
+                        h = _host(href)
+                        if "taboola" in h:
+                            network = "Taboola"
+                        elif "outbrain" in h:
+                            network = "Outbrain"
 
-                        # split into brand/headline/desc (legacy-like)
-                        brand, headline, desc = _split_brand_headline_desc(text)
-
-                        # CTA detection
-                        cta_text = ""
-                        for w in ("See", "Discover", "Search", "Take", "Learn", "Explore", "Read"):
-                            if re.search(rf"\b{w}\b", text, re.IGNORECASE):
-                                cta_text = w
-                                break
-
-                        # editorial filters (similar to legacy)
-                        headline_low = headline.lower()
-                        if any(bad in headline_low for bad in [
-                            "video file", "breaking", "exclusive", "update", "interview", "report"
-                        ]):
-                            continue
-                        # if same-site AND no CTA AND no desc, likely editorial promo
-                        if same_host(href, url) and not cta_text and not desc:
-                            continue
-
-                        # final sanity
-                        headline = re.sub(r"\s+", " ", headline).strip()
-                        desc = re.sub(r"\s+", " ", (desc or "")).strip()
-                        if not headline or len(headline.split()) < 3:
-                            continue
-                        if headline.lower() in {"ad", "sponsored", "ad ad"}:
-                            continue
-
-                        # follow redirects only if it looks like a tracker
                         dest = href
-                        if RESOLVE_DEST_URL and should_resolve(href):
-                            dest = await async_resolve_final_url(href)
-                            if _host(dest) in _TRACKER_HOSTS:
-                                # still a tracker; keep original
-                                dest = href
+                        needs_resolve = RESOLVE_DEST_URL and (should_resolve(href) or "taboola" in h or "outbrain" in h)
+                        if needs_resolve:
+                            dest_try = await async_resolve_final_url(href)
+                            if _host(dest_try) not in _TRACKER_HOSTS:
+                                dest = dest_try
 
                         row = {
                             "source": name,
                             "type": "ad",
                             "position": f"native_ad_{len(all_rows)+1}",
-                            "brand": brand or name,
+                            "brand": (brand or name).strip(),
                             "headline": headline,
                             "ad_description": desc,
                             "image_url": image_url,
@@ -419,19 +641,279 @@ async def async_run_native_scan(output_file):
                         all_rows.append(row)
                         kept += 1
 
-                st.write(f"✅ {name}: kept {kept} creatives after filtering")
+                st.write(f"{name}: kept {kept} creatives after filtering")
+                if kept == 0:
+                    try:
+                        shot = os.path.join(EXPORTS_DIR, f"native_debug_{_host(url)}_{timestamp()}.png")
+                        await page.screenshot(path=shot, full_page=True)
+                        st.write(f"{name}: saved debug screenshot -> {shot}")
+                    except Exception:
+                        pass
             finally:
                 await page.close()
 
-        # run each site with a per-site watchdog
+        # per-site watchdog
         for src in sources:
             url = src["url"]
             try:
                 await asyncio.wait_for(_scan_one_site(src), timeout=SITE_DEADLINE_S)
             except asyncio.TimeoutError:
-                st.warning(f"[⏱️ Native] Timed out scanning {url} after {SITE_DEADLINE_S}s — skipping.")
+                st.warning(f"[Native] Timed out scanning {url} after {SITE_DEADLINE_S}s — skipping.")
             except Exception as e:
-                st.warning(f"[❌ Native] Error scanning {url}: {e}")
+                st.warning(f"[Native] Error scanning {url}: {e}")
+
+        await context.close()
+        await browser.close()
+
+    # write results
+    if not all_rows:
+        st.warning("⚠️ No native ads detected in this scan.")
+        cols = [
+            "source","type","position","brand","headline","ad_description",
+            "image_url","original_url","dest_url","hash_id","date_seen","network",
+            "cluster","hash_recurrence"
+        ]
+        pd.DataFrame(columns=cols).to_csv(output_file, index=False)
+        return
+
+    df = pd.DataFrame(all_rows)
+    df["cluster"] = df.apply(assign_cluster, axis=1)
+    df["hash_recurrence"] = df["hash_id"].apply(
+        lambda h: 1 if h in load_prior_hashes("native", output_file) else 0
+    )
+    df.to_csv(output_file, index=False)
+    st.success(f"✅ Saved native results: {output_file}")
+
+    async def _scan_one_site(src):
+        url = src["url"]
+        name = src.get("name", _host(url)) or _host(url)
+        st.write(f"Scanning: {url}")
+
+        page = await context.new_page()
+        kept_total = 0
+        try:
+            # ---------- first pass on the landing page ----------
+            await page.goto(url, timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+            await _reliably_wait_for_taboola(page)
+
+            # lazy-load scroll
+            for _ in range(SCROLL_STEPS):
+                await page.mouse.wheel(0, 1200)
+                await asyncio.sleep(SCROLL_SLEEP_S)
+            await asyncio.sleep(POST_INJECT_WAIT_S)
+
+            containers = await _find_native_containers(page)
+
+            # ---------- NBC-specific drilldown if nothing found ----------
+            if not containers and _host(url) == "nbcnews.com":
+                # collect up to 6 fresh article links off homepage
+                links = await _collect_article_links(page, limit=6)
+                st.write(f"NBC drilldown: {len(links)} candidate article pages")
+                for i, art in enumerate(links):
+                    try:
+                        await page.goto(art, timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+                        await _reliably_wait_for_taboola(page)
+
+                        # short scroll on article to reach mid/bottom widgets
+                        for _ in range(6):
+                            await page.mouse.wheel(0, 1400)
+                            await asyncio.sleep(0.9)
+                        await asyncio.sleep(2.0)
+
+                        containers = await _find_native_containers(page)
+                        if containers:
+                            st.write(f"Found native containers on article {i+1}: {art}")
+                            break
+                    except Exception as e:
+                        st.write(f"Drilldown article failed: {e}")
+                        continue
+
+            # ---------- one gentle reload retry if still empty ----------
+            if not containers:
+                try:
+                    await page.reload(timeout=GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+                    await _reliably_wait_for_taboola(page)
+                    for _ in range(6):
+                        await page.mouse.wheel(0, 1400)
+                        await asyncio.sleep(0.9)
+                    await asyncio.sleep(2.0)
+                    containers = await _find_native_containers(page)
+                except Exception:
+                    pass
+
+            st.write(f"{name}: found {len(containers)} native containers")
+            containers = containers[:MAX_CONTAINERS]
+
+            seen = set()
+            kept = 0
+
+            for el in containers:
+                # network hint
+                try:
+                    html_chunk = await el.evaluate("(n) => n.outerHTML")
+                except Exception:
+                    html_chunk = ""
+                network = detect_ad_network_from_html((html_chunk or "").lower())
+
+                link_loc = el.locator("a[href]")
+                link_count = min(await link_loc.count(), MAX_LINKS_PER_CONTAINER)
+
+                for idx in range(link_count):
+                    link = link_loc.nth(idx)
+                    href = (await link.get_attribute("href")) or ""
+                    if not is_external_ad(href, url):
+                        continue
+                    if href.startswith("//"):
+                        href = "https:" + href
+
+                    # attribute-aware extraction
+                    headline = ""
+                    brand = ""
+                    desc = ""
+                    image_url = ""
+
+                    for attr in ("data-item-title","aria-label","title"):
+                        try:
+                            v = await link.get_attribute(attr)
+                            if v and v.strip():
+                                headline = v.strip()
+                                break
+                        except Exception:
+                            pass
+
+                    if not headline:
+                        try:
+                            parent = await link.evaluate_handle(
+                                "(n)=>n.closest('[data-item-title],[data-brand],[data-description]')"
+                            )
+                            if parent:
+                                for attr in ("data-item-title","aria-label","title"):
+                                    v = await parent.get_attribute(attr)  # type: ignore
+                                    if v and v.strip():
+                                        headline = v.strip()
+                                        break
+                        except Exception:
+                            pass
+
+                    if not headline:
+                        try:
+                            raw_text = await link.inner_text()
+                        except Exception:
+                            raw_text = await link.evaluate("(n) => (n.textContent || '')")
+                        headline = (raw_text or "").strip()
+                    headline = _clean_text(headline)
+
+                    for attr in ("data-brand","data-publisher"):
+                        try:
+                            v = await link.get_attribute(attr)
+                            if v and v.strip():
+                                brand = v.strip()
+                                break
+                        except Exception:
+                            pass
+
+                    for attr in ("data-description","data-item-description"):
+                        try:
+                            v = await link.get_attribute(attr)
+                            if v and v.strip():
+                                desc = v.strip()
+                                break
+                        except Exception:
+                            pass
+
+                    img = link.locator("img").first
+                    try:
+                        if await img.count():
+                            image_url = await img.get_attribute("src") or ""
+                            if not image_url:
+                                image_url = await img.get_attribute("data-src") or ""
+                            if not image_url:
+                                srcset = await img.get_attribute("srcset") or ""
+                                if srcset:
+                                    image_url = srcset.split(",")[0].split()[0]
+                    except Exception:
+                        image_url = ""
+
+                    if not headline or len(headline) < 8:
+                        combined = " ".join([brand, headline, desc]).strip()
+                        if not combined:
+                            try:
+                                combined = await link.inner_text()
+                            except Exception:
+                                combined = await link.evaluate("(n) => (n.textContent || '')")
+                        b2, h2, d2 = _split_brand_headline_desc(_clean_text(combined))
+                        brand = brand or b2
+                        headline = headline or h2
+                        desc = desc or d2
+
+                    headline = re.sub(r"\s+", " ", headline or "").strip()
+                    desc = re.sub(r"\s+", " ", (desc or "")).strip()
+                    if not headline or len(headline) < 12 or len(headline.split()) < 2:
+                        continue
+                    if headline.lower() in {"ad","sponsored","ad ad"}:
+                        continue
+
+                    cta_text = ""
+                    for w in ("See","Discover","Search","Take","Learn","Explore","Read"):
+                        if re.search(rf"\b{w}\b", f"{headline} {desc}", re.IGNORECASE):
+                            cta_text = w
+                            break
+
+                    headline_low = headline.lower()
+                    if any(bad in headline_low for bad in ["video file","breaking","exclusive","update","interview","report"]):
+                        continue
+                    if same_host(href, url) and not cta_text and not desc:
+                        continue
+
+                    key = f"{headline}||{href}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    h = _host(href)
+                    if "taboola" in h:
+                        network = "Taboola"
+                    elif "outbrain" in h:
+                        network = "Outbrain"
+
+                    dest = href
+                    needs_resolve = RESOLVE_DEST_URL and (should_resolve(href) or "taboola" in h or "outbrain" in h)
+                    if needs_resolve:
+                        dest_try = await async_resolve_final_url(href)
+                        if _host(dest_try) not in _TRACKER_HOSTS:
+                            dest = dest_try
+
+                    row = {
+                        "source": name,
+                        "type": "ad",
+                        "position": f"native_ad_{len(all_rows)+1}",
+                        "brand": (brand or name).strip(),
+                        "headline": headline,
+                        "ad_description": desc,
+                        "image_url": image_url,
+                        "original_url": href,
+                        "dest_url": dest,
+                        "hash_id": hash_creative(headline + image_url),
+                        "date_seen": DATE_SEEN,
+                        "network": network,
+                    }
+                    all_rows.append(row)
+                    kept += 1
+                    kept_total += 1
+
+            st.write(f"{name}: kept {kept} creatives after filtering")
+        finally:
+            await page.close()   
+
+        # run with a per-site watchdog
+        for src in sources:
+            url = src["url"]
+            try:
+                await asyncio.wait_for(_scan_one_site(src), timeout=SITE_DEADLINE_S)
+            except asyncio.TimeoutError:
+                st.warning(f"[Native] Timed out scanning {url} after {SITE_DEADLINE_S}s — skipping.")
+            except Exception as e:
+                st.warning(f"[Native] Error scanning {url}: {e}")
 
         await context.close()
         await browser.close()
@@ -470,10 +952,10 @@ def run_yahoo_scan(output_file, seeds=None):
     if not seeds:
         # Strong defaults that consistently return results/ads
         seeds = [
-            "cd rates", "mortgage rates", "best credit cards", "car insurance quotes",
-            "injury lawyer", "mesothelioma lawyer", "dental implants cost",
+            "cd rates", "car insurance quotes",
+            "injury lawyer", "dental implants cost",
             "home solar quotes", "replacement windows", "cheap flights",
-            "personal loans", "online mba", "hearing aids", "cloud software"
+            "new ev suvs", "online mba", "hearing aids", "software"
         ]
 
     HEADERS = {

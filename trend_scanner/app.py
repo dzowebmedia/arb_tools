@@ -106,6 +106,44 @@ def _norm_header(s: str) -> str:
     s = re.sub(r"\s*\d+$","", s)
     return s
 
+def _ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee Keyword Niche Geo exist with sane defaults or mapped aliases."""
+    cols = {c.lower(): c for c in df.columns}
+
+    # Keyword
+    if "keyword" not in cols:
+        raise KeyError("Missing Keyword column")
+
+    # Niche from common aliases
+    niche_src = None
+    for cand in ("niche","category","cluster","topic","niche_code"):
+        if cand in cols:
+            niche_src = cols[cand]
+            break
+    if "Niche" not in df.columns:
+        if niche_src:
+            df["Niche"] = df[niche_src].astype(str)
+        else:
+            df["Niche"] = "General"
+
+    # Geo from common aliases
+    geo_src = None
+    for cand in ("geo","country","market","dma","region"):
+        if cand in cols:
+            geo_src = cols[cand]
+            break
+    if "Geo" not in df.columns:
+        if geo_src:
+            df["Geo"] = df[geo_src].astype(str)
+        else:
+            df["Geo"] = "US"
+
+    # Normalize canonical column name for Keyword
+    if "Keyword" not in df.columns:
+        df["Keyword"] = df[cols["keyword"]].astype(str)
+
+    return df
+
 def _best_canon(raw: str) -> str | None:
     n = _norm_header(raw)
     for canon, rules in SYNONYMS.items():
@@ -993,6 +1031,9 @@ def winners_WoW(hist: pd.DataFrame, min_clicks: int, K: float, factor_WoW: float
 
     return out
 
+from datetime import timedelta
+import numpy as np  # make sure numpy is imported once at top of file
+
 def surges_low_to_high(
     hist: pd.DataFrame,
     min_clicks: int,
@@ -1001,45 +1042,77 @@ def surges_low_to_high(
     K: float,
     factor_surge: float,
 ):
-    if hist.empty:
+    if hist is None or hist.empty:
         return pd.DataFrame()
+
     df = hist.copy()
-    df["date"] = pd.to_datetime(df["date"])
+
+    # date safety
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return pd.DataFrame()
+
+    # ensure grouping columns exist; backfill if absent
+    for col, fill in (("Keyword", None), ("Niche", "ALL"), ("Geo", "ALL")):
+        if col not in df.columns:
+            df[col] = fill
+    group_cols = [c for c in ["Keyword", "Niche", "Geo"] if c in df.columns]
+
     last_day = df["date"].max()
+    if pd.isna(last_day):
+        return pd.DataFrame()
+
+    baseline_weeks = max(int(baseline_weeks or 0), 1)
     baseline_start = last_day - timedelta(days=7 * baseline_weeks)
+
     base = df[(df["date"] >= baseline_start) & (df["date"] < last_day)]
     today = df[df["date"] == last_day]
     if base.empty or today.empty:
         return pd.DataFrame()
-    b = base.groupby(["Keyword", "Niche", "Geo"], as_index=False).agg(
-        base_clicks=("Clicks", "sum"), base_rpc=("RPC", "mean")
+
+    # aggregate baseline
+    b = (
+        base.groupby(group_cols, as_index=False)
+            .agg(base_clicks=("Clicks", "sum"), base_rpc=("RPC", "mean"))
     )
-    t = today[["Keyword", "Niche", "Geo", "Clicks", "RPC"]]
-    out = t.merge(b, on=["Keyword", "Niche", "Geo"], how="left").fillna(
-        {"base_clicks": 0, "base_rpc": t["RPC"].median() if len(t) else 0}
-    )
+
+    # today slice
+    t = today[group_cols + ["Clicks", "RPC"]].copy()
+
+    # merge and fallback fills
+    out = t.merge(b, on=group_cols, how="left")
+    fallback_rpc = t["RPC"].median() if len(t) else 0.0
+    out["base_clicks"] = out["base_clicks"].fillna(0).astype(float)
+    out["base_rpc"] = out["base_rpc"].fillna(fallback_rpc).astype(float)
+
+    # safe lift calc (no div by zero; treat 0 baseline as no lift)
+    denom = out["base_rpc"].replace(0, np.nan)
+    out["lift_vs_base_pct"] = ((out["RPC"] - out["base_rpc"]) / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # optional trimming of very high-baseline RPC cohorts
     if len(out) >= 4:
         q1 = out["base_rpc"].quantile(0.25)
         out = out[out["base_rpc"] <= q1]
-    out["lift_vs_base_pct"] = (out["RPC"] - out["base_rpc"]) / out["base_rpc"].replace(
-        0, 1
-    )
-    out = out[
-        (out["lift_vs_base_pct"] >= surge_threshold) & (out["Clicks"] >= min_clicks)
-    ]
+
+    # threshold filters
+    out = out[(out["lift_vs_base_pct"] >= float(surge_threshold)) & (out["Clicks"] >= int(min_clicks))]
+    if out.empty:
+        return out
+
+    # CPC cap using your existing helper
     out["cpc_cap"] = out.apply(
-        lambda r: cpc_cap_calc(
-            r["RPC"], r["base_rpc"], r["Clicks"], K, factor_surge, r["Clicks"]
-        ),
+        lambda r: cpc_cap_calc(r["RPC"], r["base_rpc"], r["Clicks"], K, factor_surge, r["Clicks"]),
         axis=1,
     )
-    out.sort_values(
-        ["lift_vs_base_pct", "RPC", "Clicks"],
-        ascending=[False, False, False],
-        inplace=True,
-    )
-    return out
 
+    # tidy columns and order
+    keep = group_cols + ["Clicks", "RPC", "base_clicks", "base_rpc", "lift_vs_base_pct", "cpc_cap"]
+    out = out[keep].sort_values(
+        ["lift_vs_base_pct", "RPC", "Clicks"], ascending=[False, False, False]
+    ).reset_index(drop=True)
+
+    return out
 
 def write_plan_payload(dod: pd.DataFrame, wow: pd.DataFrame, sur: pd.DataFrame):
     top_dod = (
@@ -1187,6 +1260,11 @@ with st.expander("Daily Scanner", expanded=True):
             hist = pd.concat([hist, today_roll], ignore_index=True)
         else:
             hist = today_roll.copy()
+
+        # NEW normalize so Niche and Geo always exist
+        hist = _ensure_required_cols(hist)
+        # optional if you also want today’s file normalized when saved
+        today_roll = _ensure_required_cols(today_roll)
 
         save_history(hist)
         save_csv(today_roll, "rollup_daily.csv")
