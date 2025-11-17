@@ -225,32 +225,47 @@ def translate_ad_creatives_df(df: pd.DataFrame, target_language_label: str) -> p
     return df
 
 # ------------------------------
-# Keyword block logic
+# Keyword block config and logic
 # ------------------------------
 
-def compose_blocks(seed: str) -> list[str]:
-    base = _title_case(seed)
-    fams = [
-        "{base}",
-        "Best {base}",
-        "{base} Near Me",
-        "{base} Prices",
-        "{year} {base}",
-    ]
-    blocks = []
-    seen = set()
-    for t in fams:
-        b = t.format(base=base, year=CURRENT_YEAR).strip()
-        if b not in seen:
-            seen.add(b)
-            blocks.append(b)
-    return blocks
+BLOCK_FAMILIES = [
+    # template              mode
+    ("{base}",              "base"),
+    ("Best {base}",         "best"),
+    ("{base} Near Me",      "near"),
+    ("{base} Prices",       "prices"),
+    ("{year} {base} Sale",  "year_sale"),
+]
 
-def generate_variants_for_block(block_title: str, seed: str) -> list[str]:
+def build_block_definitions(seed: str) -> list[tuple[str, str]]:
+    """
+    From a seed return a list of (block_title, mode) pairs
+    driven entirely by BLOCK_FAMILIES
+    """
+    base = _title_case(seed)
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for template, mode in BLOCK_FAMILIES:
+        title = template.format(base=base, year=CURRENT_YEAR).strip()
+        if not title:
+            continue
+        if title in seen:
+            continue
+        seen.add(title)
+        out.append((title, mode))
+
+    return out
+
+def generate_variants_for_block(block_title: str, seed: str, mode: str) -> list[str]:
+    """
+    Build up to 4 variants per block with minimal duplication
+    Block behavior is controlled by the mode string
+    so you can change BLOCK_FAMILIES without touching this function
+    """
     title = _title_case(block_title)
     seed_title = _title_case(seed)
     tokens = seed_title.split()
-    low = title.lower()
 
     def toggle_plural_word(w: str) -> str:
         if re.search(r"s$", w, re.I):
@@ -297,7 +312,7 @@ def generate_variants_for_block(block_title: str, seed: str) -> list[str]:
 
     variants: list[str] = []
 
-    if low.startswith("best "):
+    if mode == "best":
         core = seed_title
         r1, r2 = reorder_three(tokens)
         v1 = f"Best {core}"
@@ -305,28 +320,32 @@ def generate_variants_for_block(block_title: str, seed: str) -> list[str]:
         v3 = f"Best {r2}"
         v4 = f"Best {plural_main_noun(core)}"
         variants = [v1, v2, v3, v4]
-    elif "near me" in low:
+
+    elif mode == "near":
         core_seed = seed_title + " Near Me"
         v1 = core_seed
         v2 = plural_main_noun(core_seed)
         v3 = brand_plural_seed(core_seed)
         v4 = f"Near Me {seed_title}"
         variants = [v1, v2, v3, v4]
-    elif low.endswith(" prices"):
+
+    elif mode == "prices":
         seed_prices = seed_title + " Prices"
         v1 = seed_prices
         v2 = plural_main_noun(seed_prices)
         v3 = "Prices " + brand_plural_seed(seed_title)
         v4 = seed_title + " Cost"
         variants = [v1, v2, v3, v4]
-    elif title.split()[0].isdigit():
+
+    elif mode == "year_sale":
         year_tok = title.split()[0]
-        core_seed = f"{year_tok} {seed_title}"
+        core_seed = f"{year_tok} {seed_title} Sale"
         v1 = core_seed
-        v2 = f"{year_tok} {plural_main_noun(seed_title)}"
-        v3 = f"{brand_plural_seed(seed_title)} {year_tok}"
-        v4 = f"{seed_title} {year_tok}"
+        v2 = plural_main_noun(core_seed)
+        v3 = f"{brand_plural_seed(seed_title)} {year_tok} Sale"
+        v4 = f"{seed_title} {year_tok} Sale"
         variants = [v1, v2, v3, v4]
+
     else:
         core = seed_title
         r1, r2 = reorder_three(tokens)
@@ -337,15 +356,16 @@ def generate_variants_for_block(block_title: str, seed: str) -> list[str]:
         variants = [v1, v2, v3, v4]
 
     clean: list[str] = []
-    seen = set()
+    seen_set: set[str] = set()
     for v in variants:
         v_clean = v.strip()
         if not v_clean:
             continue
         key = v_clean.lower()
-        if key not in seen:
-            seen.add(key)
-            clean.append(v_clean)
+        if key in seen_set:
+            continue
+        seen_set.add(key)
+        clean.append(v_clean)
 
     clean = clean[:VARIANTS_PER_BLOCK]
     if len(clean) < VARIANTS_PER_BLOCK:
@@ -391,15 +411,15 @@ def generate_campaign(seed: str, language_label: str) -> dict:
     today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
     campaign_name = f"{_slugify(seed_clean)}-{today_str}"
 
-    blocks = compose_blocks(seed_clean)
+    block_defs = build_block_definitions(seed_clean)
     rows = []
-    for b in blocks:
-        variants = generate_variants_for_block(b, seed_clean)
+    for title, mode in block_defs:
+        variants = generate_variants_for_block(title, seed_clean, mode)
 
         rows.append({
             "campaign_name": campaign_name,
             "seed_keyword": seed_title,
-            "block_title": b,
+            "block_title": title,
             "variant_term_1": variants[0] if len(variants) > 0 else "",
             "variant_term_2": variants[1] if len(variants) > 1 else "",
             "variant_term_3": variants[2] if len(variants) > 2 else "",
