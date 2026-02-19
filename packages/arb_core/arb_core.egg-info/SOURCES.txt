@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+arb_core/__init__.py
+arb_core/config.py
+arb_core/io.py
+arb_core/net.py
+arb_core/text.py
+arb_core.egg-info/PKG-INFO
+arb_core.egg-info/SOURCES.txt
+arb_core.egg-info/dependency_links.txt
+arb_core.egg-info/top_level.txt
