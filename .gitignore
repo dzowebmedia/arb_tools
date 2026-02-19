@@ -22,3 +22,6 @@ application_default_credentials.json
 .gcloud/
 three_click_optimizer/outputs/
 *.xlsx
+*.db
+*-wal
+*-shm
