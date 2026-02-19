@@ -1,0 +1,95 @@
+main:
+  steps:
+    - init:
+        assign:
+          - project: "adroit-outlet-482711-h0"
+          - region: "us-central1"
+          - scan_job: "native-ad-scan-job"
+          - enrich_job: "native-ad-enrich-job"
+
+    - run_scan:
+        call: http.post
+        args:
+          url: ${"https://run.googleapis.com/v2/projects/" + project + "/locations/" + region + "/jobs/" + scan_job + ":run"}
+          auth:
+            type: OAuth2
+        result: scan_op
+
+    - scan_op_name:
+        assign:
+          - scan_op_name: ${scan_op.body.name}
+
+    - poll_scan_op:
+        call: http.get
+        args:
+          url: ${"https://run.googleapis.com/v2/" + scan_op_name}
+          auth:
+            type: OAuth2
+        result: scan_op_status
+
+    - scan_done_switch:
+        switch:
+          - condition: ${("done" in scan_op_status.body) and scan_op_status.body.done == true}
+            next: scan_done_check
+        next: scan_sleep
+
+    - scan_sleep:
+        call: sys.sleep
+        args:
+          seconds: 15
+        next: poll_scan_op
+
+    - scan_done_check:
+        switch:
+          - condition: ${("error" in scan_op_status.body) and scan_op_status.body.error != null}
+            next: scan_failed
+        next: run_enrich
+
+    - scan_failed:
+        raise: "Scan run failed"
+
+    - run_enrich:
+        call: http.post
+        args:
+          url: ${"https://run.googleapis.com/v2/projects/" + project + "/locations/" + region + "/jobs/" + enrich_job + ":run"}
+          auth:
+            type: OAuth2
+        result: enrich_op
+
+    - enrich_op_name:
+        assign:
+          - enrich_op_name: ${enrich_op.body.name}
+
+    - poll_enrich_op:
+        call: http.get
+        args:
+          url: ${"https://run.googleapis.com/v2/" + enrich_op_name}
+          auth:
+            type: OAuth2
+        result: enrich_op_status
+
+    - enrich_done_switch:
+        switch:
+          - condition: ${("done" in enrich_op_status.body) and enrich_op_status.body.done == true}
+            next: enrich_done_check
+        next: enrich_sleep
+
+    - enrich_sleep:
+        call: sys.sleep
+        args:
+          seconds: 10
+        next: poll_enrich_op
+
+    - enrich_done_check:
+        switch:
+          - condition: ${("error" in enrich_op_status.body) and enrich_op_status.body.error != null}
+            next: enrich_failed
+        next: done
+
+    - enrich_failed:
+        raise: "Enrich run failed"
+
+    - done:
+        return:
+          scan_operation: ${scan_op_name}
+          enrich_operation: ${enrich_op_name}

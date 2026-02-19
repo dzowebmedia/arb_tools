@@ -1,3 +1,5 @@
+
+
 .DS_Store
 .vscode/
 .idea/
@@ -17,8 +19,3 @@ trend_scanner.bak/
 MSADS_TEST/msads_tokens.json
 MSADS_TEST/.env
 Scraper_Tool/creatives.db
-application_default_credentials.json
-.config/gcloud/
-.gcloud/
-three_click_optimizer/outputs/
-*.xlsx

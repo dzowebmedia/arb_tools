@@ -907,13 +907,17 @@ def winners_DoD(hist: pd.DataFrame, min_clicks: int, K: float, factor_DoD: float
     )
     out = out.merge(base7, on=["k_norm", "n_norm", "g_norm"], how="left")
 
-    # fill priors
+    # fill priors using only real history  no global median fallback
     out["Clicks_prior"] = out["Clicks_prior"].fillna(0)
-    if len(out):
-        out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC_baseline"])
-        out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC"].median())
-    else:
-        out["RPC_prior"] = 0.0
+
+    # use seven day baseline when present
+    out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC_baseline"])
+
+    # drop rows with no usable prior at all
+    out = out[out["RPC_prior"].notna() & (out["RPC_prior"] > 0)]
+
+    if out.empty:
+        return out
 
     # metrics
     out["rpc_lift_pct"] = (out["RPC"] - out["RPC_prior"]) / out["RPC_prior"].replace(
@@ -996,11 +1000,11 @@ def winners_WoW(hist: pd.DataFrame, min_clicks: int, K: float, factor_WoW: float
 
     # fill priors
     out["Clicks_prior"] = out["Clicks_prior"].fillna(0)
-    if len(out):
-        out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC_baseline"])
-        out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC"].median())
-    else:
-        out["RPC_prior"] = 0.0
+    out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC_baseline"])
+    out = out[out["RPC_prior"].notna() & (out["RPC_prior"] > 0)]
+
+    if out.empty:
+        return out
 
     # metrics
     out["rpc_lift_pct"] = (out["RPC"] - out["RPC_prior"]) / out["RPC_prior"].replace(
@@ -1082,9 +1086,15 @@ def surges_low_to_high(
 
     # merge and fallback fills
     out = t.merge(b, on=group_cols, how="left")
-    fallback_rpc = t["RPC"].median() if len(t) else 0.0
     out["base_clicks"] = out["base_clicks"].fillna(0).astype(float)
-    out["base_rpc"] = out["base_rpc"].fillna(fallback_rpc).astype(float)
+
+    # keep only rows that have real baseline RPC
+    out = out[out["base_rpc"].notna()]
+
+    if out.empty:
+        return out
+
+    out["base_rpc"] = out["base_rpc"].astype(float)
 
     # safe lift calc (no div by zero; treat 0 baseline as no lift)
     denom = out["base_rpc"].replace(0, np.nan)
@@ -1113,6 +1123,41 @@ def surges_low_to_high(
     ).reset_index(drop=True)
 
     return out
+
+def new_high_rpc_no_history(hist: pd.DataFrame, today: date, rpc_floor: float = 1.0) -> pd.DataFrame:
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+
+    df = hist.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return pd.DataFrame()
+
+    today_str = today.strftime("%Y-%m-%d")
+    today_slice = df[df["date"] == today_str].copy()
+    prior_slice = df[df["date"] < today_str].copy()
+
+    if today_slice.empty:
+        return pd.DataFrame()
+
+    today_slice = _add_norm_cols(today_slice)
+    prior_slice = _add_norm_cols(prior_slice)
+
+    prior_keys = set(
+        zip(prior_slice["k_norm"], prior_slice["n_norm"], prior_slice["g_norm"])
+    )
+
+    today_slice["has_history"] = list(
+        zip(today_slice["k_norm"], today_slice["n_norm"], today_slice["g_norm"])
+    )
+    today_slice["has_history"] = today_slice["has_history"].isin(prior_keys)
+
+    fresh = today_slice[~today_slice["has_history"]].copy()
+    fresh = fresh[fresh["RPC"] >= float(rpc_floor)]
+
+    cols = ["Keyword", "Niche", "Geo", "RPC", "Clicks"]
+    return fresh[cols] if not fresh.empty else pd.DataFrame(columns=cols)
 
 def write_plan_payload(dod: pd.DataFrame, wow: pd.DataFrame, sur: pd.DataFrame):
     top_dod = (
@@ -1260,6 +1305,10 @@ with st.expander("Daily Scanner", expanded=True):
             hist = pd.concat([hist, today_roll], ignore_index=True)
         else:
             hist = today_roll.copy()
+
+        new_high = new_high_rpc_no_history(hist, today, rpc_floor=1.0)
+        st.session_state["new_high"] = new_high.copy()
+        save_csv(new_high, "new_high_rpc_no_history.csv")            
 
         # NEW normalize so Niche and Geo always exist
         hist = _ensure_required_cols(hist)
@@ -1425,6 +1474,9 @@ with cC:
     st.dataframe(st.session_state.get("sur"), use_container_width=True)
 
 st.divider()
+
+st.caption("New Terms RPC > 1.00 with No Prior History")
+st.dataframe(st.session_state.get("new_high"), use_container_width=True)
 
 # =====================
 # Public Signals (Trends + Suggest + RSS + Modifiers) — robust seed sourcing

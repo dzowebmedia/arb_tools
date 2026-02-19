@@ -288,65 +288,218 @@ def _norm_join_keys(df:pd.DataFrame)->list[str]:
     if "g_norm" in df.columns: keys.append("g_norm")
     return keys
 
-def winners_DoD(hist:pd.DataFrame)->pd.DataFrame:
-    if hist.empty: return pd.DataFrame()
-    df=hist.copy(); df["date"]=pd.to_datetime(df["date"],errors="coerce")
-    dates=sorted([d for d in df["date"].unique() if pd.notna(d)])
-    if len(dates)<2: return pd.DataFrame()
-    today,yest=dates[-1],dates[-2]
-    join_cols=[c for c in ("Keyword","Niche","Device","Geo") if c in df.columns]
-    base_cols=join_cols+["RPC"]
-    d0=_add_norm_cols(df[df["date"]==today][base_cols])
-    d1=_add_norm_cols(df[df["date"]==yest][base_cols])
-    keys=_norm_join_keys(d0)
-    prior=d1[keys+["RPC"]].rename(columns={"RPC":"RPC_prior"})
-    out=d0.merge(prior,on=keys,how="left")
-    out["RPC_prior"]=out["RPC_prior"].fillna(out["RPC"])
-    out["rpc_lift_pct"]=(out["RPC"]-out["RPC_prior"])/out["RPC_prior"].replace(0,1)
-    out=out.sort_values(["rpc_lift_pct","RPC"],ascending=[False,False])
-    drop_norm=[c for c in ("k_norm","n_norm","d_norm","g_norm") if c in out.columns]
-    return out.drop(columns=drop_norm,errors="ignore")
+def winners_DoD(hist: pd.DataFrame) -> pd.DataFrame:
+    if hist.empty:
+        return pd.DataFrame()
 
-def winners_WoW(hist:pd.DataFrame)->pd.DataFrame:
-    if hist.empty: return pd.DataFrame()
-    df=hist.copy(); df["date"]=pd.to_datetime(df["date"],errors="coerce")
-    last_day=df["date"].max()
-    if pd.isna(last_day): return pd.DataFrame()
-    this_week_start=last_day-timedelta(days=6)
-    prev_week_end=this_week_start-timedelta(days=1)
-    prev_week_start=prev_week_end-timedelta(days=6)
-    join_cols=[c for c in ("Keyword","Niche","Device","Geo") if c in df.columns]
-    wk=df[(df["date"]>=this_week_start) & (df["date"]<=last_day)]
-    pw=df[(df["date"]>=prev_week_start) & (df["date"]<=prev_week_end)]
-    w0=wk.groupby(join_cols,as_index=False).agg(RPC=("RPC","mean"))
-    w1=pw.groupby(join_cols,as_index=False).agg(RPC_prior=("RPC","mean"))
-    w0=_add_norm_cols(w0); w1=_add_norm_cols(w1)
-    keys=_norm_join_keys(w0)
-    out=w0.merge(w1[keys+["RPC_prior"]],on=keys,how="left")
-    out["RPC_prior"]=out["RPC_prior"].fillna(out["RPC"])
-    out["rpc_lift_pct"]=(out["RPC"]-out["RPC_prior"])/out["RPC_prior"].replace(0,1)
-    out=out.sort_values(["rpc_lift_pct","RPC"],ascending=[False,False])
-    drop_norm=[c for c in ("k_norm","n_norm","d_norm","g_norm") if c in out.columns]
-    return out.drop(columns=drop_norm,errors="ignore")
+    df = hist.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return pd.DataFrame()
 
-def surges_low_to_high(hist:pd.DataFrame,baseline_weeks:int,surge_threshold:float):
-    if hist.empty: return pd.DataFrame()
-    df=hist.copy(); df["date"]=pd.to_datetime(df["date"])
-    last_day=df["date"].max()
-    baseline_start=last_day-timedelta(days=7*baseline_weeks)
-    base=df[(df["date"]>=baseline_start) & (df["date"]<last_day)]
-    today=df[df["date"]==last_day]
-    if base.empty or today.empty: return pd.DataFrame()
-    b=base.groupby(["Keyword","Device","Geo"],as_index=False).agg(base_rpc=("RPC","mean"))
-    t=today[["Keyword","Device","Geo","RPC"]]
-    out=t.merge(b,on=["Keyword","Device","Geo"],how="left").fillna({"base_rpc":t["RPC"].median() if len(t) else 0.0})
-    if len(out)>=4:
-        q1=out["base_rpc"].quantile(0.25)
-        out=out[out["base_rpc"]<=q1]
-    out["lift_vs_base_pct"]=(out["RPC"]-out["base_rpc"])/out["base_rpc"].replace(0,1)
-    out=out[out["lift_vs_base_pct"]>=surge_threshold]
-    out.sort_values(["lift_vs_base_pct","RPC"],ascending=[False,False],inplace=True)
+    dates = sorted(df["date"].unique())
+    if len(dates) < 2:
+        return pd.DataFrame()
+
+    today = dates[-1]
+    yest = dates[-2]
+
+    # add normalized join keys
+    df = _add_norm_cols(df)
+
+    # today slice
+    d0 = df[df["date"] == today].copy()
+
+    # yesterday slice
+    d1 = df[df["date"] == yest].copy()
+
+    keys = _norm_join_keys(d0)
+    if not keys:
+        return pd.DataFrame()
+
+    prior = d1[keys + ["RPC"]].rename(columns={"RPC": "RPC_prior"})
+    out = d0.merge(prior, on=keys, how="left")
+
+    # seven day baseline before today as smarter fallback
+    prev7 = df[(df["date"] < today) & (df["date"] >= today - timedelta(days=7))]
+    if not prev7.empty:
+        base7 = prev7.groupby(keys, as_index=False).agg(RPC_baseline=("RPC", "mean"))
+        out = out.merge(base7, on=keys, how="left")
+    else:
+        out["RPC_baseline"] = pd.NA
+
+    # fill prior only from real history
+    out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC_baseline"])
+
+    # drop rows with no usable prior at all
+    out = out[out["RPC_prior"].notna() & (out["RPC_prior"] > 0)]
+
+    if out.empty:
+        return out
+
+    out["rpc_lift_pct"] = (out["RPC"] - out["RPC_prior"]) / out["RPC_prior"].replace(0, 1)
+
+    out = out.sort_values(["rpc_lift_pct", "RPC"], ascending=[False, False])
+
+    drop_norm = [c for c in ("k_norm", "n_norm", "d_norm", "g_norm", "RPC_baseline") if c in out.columns]
+    return out.drop(columns=drop_norm, errors="ignore")
+
+def winners_WoW(hist: pd.DataFrame) -> pd.DataFrame:
+    if hist.empty:
+        return pd.DataFrame()
+
+    df = hist.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return pd.DataFrame()
+
+    last_day = df["date"].max()
+    if pd.isna(last_day):
+        return pd.DataFrame()
+
+    this_week_start = last_day - timedelta(days=6)
+    prev_week_end = this_week_start - timedelta(days=1)
+    prev_week_start = prev_week_end - timedelta(days=6)
+
+    df = _add_norm_cols(df)
+    keys = _norm_join_keys(df)
+    if not keys:
+        return pd.DataFrame()
+
+    wk = df[(df["date"] >= this_week_start) & (df["date"] <= last_day)].copy()
+    pw = df[(df["date"] >= prev_week_start) & (df["date"] <= prev_week_end)].copy()
+
+    if wk.empty:
+        return pd.DataFrame()
+
+    # aggregate current week
+    w0 = wk.groupby(keys, as_index=False).agg(RPC=("RPC", "mean"))
+
+    # bring back display columns from first occurrence
+    first = wk.groupby(keys, as_index=False).agg(
+        Keyword=("Keyword", "first"),
+        Device=("Device", "first"),
+        Geo=("Geo", "first"),
+    )
+    w0 = w0.merge(first, on=keys, how="left")
+
+    # aggregate previous week
+    if not pw.empty:
+        w1 = pw.groupby(keys, as_index=False).agg(RPC_prior=("RPC", "mean"))
+    else:
+        w1 = pd.DataFrame(columns=keys + ["RPC_prior"])
+
+    out = w0.merge(w1, on=keys, how="left")
+
+    # twenty eight day baseline before this week as smarter fallback
+    prev28 = df[(df["date"] < this_week_start) & (df["date"] >= this_week_start - timedelta(days=28))]
+    if not prev28.empty:
+        base28 = prev28.groupby(keys, as_index=False).agg(RPC_baseline=("RPC", "mean"))
+        out = out.merge(base28, on=keys, how="left")
+    else:
+        out["RPC_baseline"] = pd.NA
+
+    out["RPC_prior"] = out["RPC_prior"].fillna(out["RPC_baseline"])
+
+    # require real prior
+    out = out[out["RPC_prior"].notna() & (out["RPC_prior"] > 0)]
+
+    if out.empty:
+        return out
+
+    out["rpc_lift_pct"] = (out["RPC"] - out["RPC_prior"]) / out["RPC_prior"].replace(0, 1)
+
+    out = out.sort_values(["rpc_lift_pct", "RPC"], ascending=[False, False])
+
+    drop_norm = [c for c in ("k_norm", "n_norm", "d_norm", "g_norm", "RPC_baseline") if c in out.columns]
+    return out.drop(columns=drop_norm, errors="ignore")
+
+def surges_low_to_high(hist: pd.DataFrame, baseline_weeks: int, surge_threshold: float):
+    if hist.empty:
+        return pd.DataFrame()
+
+    df = hist.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return pd.DataFrame()
+
+    last_day = df["date"].max()
+    if pd.isna(last_day):
+        return pd.DataFrame()
+
+    baseline_weeks = max(int(baseline_weeks or 0), 1)
+    baseline_start = last_day - timedelta(days=7 * baseline_weeks)
+
+    base = df[(df["date"] >= baseline_start) & (df["date"] < last_day)]
+    today = df[df["date"] == last_day]
+    if base.empty or today.empty:
+        return pd.DataFrame()
+
+    b = base.groupby(["Keyword", "Device", "Geo"], as_index=False).agg(base_rpc=("RPC", "mean"))
+    t = today[["Keyword", "Device", "Geo", "RPC"]].copy()
+
+    out = t.merge(b, on=["Keyword", "Device", "Geo"], how="left")
+
+    # keep only rows with real baseline
+    out = out[out["base_rpc"].notna() & (out["base_rpc"] > 0)]
+
+    if out.empty:
+        return out
+
+    if len(out) >= 4:
+        q1 = out["base_rpc"].quantile(0.25)
+        out = out[out["base_rpc"] <= q1]
+
+    out["lift_vs_base_pct"] = (out["RPC"] - out["base_rpc"]) / out["base_rpc"].replace(0, 1)
+    out = out[out["lift_vs_base_pct"] >= float(surge_threshold)]
+
+    out.sort_values(["lift_vs_base_pct", "RPC"], ascending=[False, False], inplace=True)
     return out
+def new_high_rpc_no_history(hist: pd.DataFrame, today: date, rpc_floor: float = 1.0) -> pd.DataFrame:
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+
+    df = hist.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return pd.DataFrame()
+
+    today_str = today.strftime("%Y-%m-%d")
+    today_slice = df[df["date"] == today_str].copy()
+    prior_slice = df[df["date"] < today_str].copy()
+
+    if today_slice.empty:
+        return pd.DataFrame()
+
+    today_slice = _add_norm_cols(today_slice)
+    prior_slice = _add_norm_cols(prior_slice)
+
+    # build keys using Keyword Device Geo
+    key_cols = []
+    if "k_norm" in today_slice.columns:
+        key_cols.append("k_norm")
+    if "d_norm" in today_slice.columns:
+        key_cols.append("d_norm")
+    if "g_norm" in today_slice.columns:
+        key_cols.append("g_norm")
+
+    if not key_cols:
+        return pd.DataFrame()
+
+    prior_keys = set(tuple(row[c] for c in key_cols) for _, row in prior_slice[key_cols].iterrows())
+
+    today_keys = [tuple(row[c] for c in key_cols) for _, row in today_slice[key_cols].iterrows()]
+    today_slice["has_history"] = [k in prior_keys for k in today_keys]
+
+    fresh = today_slice[~today_slice["has_history"]].copy()
+    fresh = fresh[fresh["RPC"] >= float(rpc_floor)]
+
+    cols = ["Keyword", "Device", "Geo", "RPC"]
+    return fresh[cols] if not fresh.empty else pd.DataFrame(columns=cols)
 
 def write_payload(dod:pd.DataFrame,wow:pd.DataFrame,sur:pd.DataFrame):
     top_dod=dod.head(10)[["Keyword","Device","Geo","RPC","rpc_lift_pct"]] if not dod.empty else pd.DataFrame()
@@ -501,6 +654,10 @@ def main():
             hist=today_roll.copy()
         save_history(hist)
         save_csv(today_roll,"rollup_daily_rpc.csv")
+        
+        new_high = new_high_rpc_no_history(hist, today, rpc_floor=1.0)
+        st.session_state["new_high_rpc"] = new_high.copy()
+        save_csv(new_high, "new_high_rpc_no_history_rpc.csv")
 
         dod=winners_DoD(hist)
         wow=winners_WoW(hist)

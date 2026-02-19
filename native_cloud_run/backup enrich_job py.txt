@@ -1,0 +1,536 @@
+import os
+import re
+import io
+import sys
+import json
+import hashlib
+import logging
+import time
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
+
+import pandas as pd
+from google.cloud import storage
+
+# --- add these imports near the top ---
+from google.auth.transport.requests import AuthorizedSession
+import google.auth
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("native-ad-enricher")
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_day() -> str:
+    return utc_now().date().isoformat()
+
+
+def utc_ts_compact() -> str:
+    return utc_now().strftime("%Y%m%d-%H%M%S")
+
+
+def _gcs_client() -> storage.Client:
+    return storage.Client()
+
+def _gcs_download_text(bucket: str, blob_name: str) -> str | None:
+    b = storage.Client().bucket(bucket).blob(blob_name)
+    if not b.exists():
+        return None
+    return b.download_as_text()
+
+def gcs_append_csv(bucket: str, blob_name: str, csv_text_to_append: str):
+    """
+    Append rows (no header expected) to an existing CSV blob.
+    If blob does not exist, create it WITH header by using the first append call
+    that includes header.
+    """
+    client = storage.Client()
+    bkt = client.bucket(bucket)
+    blob = bkt.blob(blob_name)
+
+    if blob.exists():
+        existing = blob.download_as_text()
+        # Ensure existing ends with newline before appending
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        combined = existing + csv_text_to_append.lstrip("\n")
+        blob.upload_from_string(combined, content_type="text/csv")
+    else:
+        # First write: include whatever caller provides
+        blob.upload_from_string(csv_text_to_append, content_type="text/csv")
+
+
+def _read_gcs_text(bucket: str, blob_name: str) -> str:
+    b = _gcs_client().bucket(bucket).blob(blob_name)
+    return b.download_as_text()
+
+
+def _write_gcs_bytes(bucket: str, blob_name: str, data: bytes, content_type: str):
+    b = _gcs_client().bucket(bucket).blob(blob_name)
+    b.upload_from_string(data, content_type=content_type)
+
+
+def _list_blobs(bucket: str, prefix: str):
+    return list(_gcs_client().bucket(bucket).list_blobs(prefix=prefix))
+
+
+def _safe_domain(u: str) -> str:
+    try:
+        h = urlparse(u).netloc.lower()
+        return h[4:] if h.startswith("www.") else h
+    except Exception:
+        return ""
+
+
+def _safe_path(u: str) -> str:
+    try:
+        return (urlparse(u).path or "").lower()
+    except Exception:
+        return ""
+
+
+def _extract_cta_word(text: str) -> str:
+    if not text:
+        return ""
+    # keep this small + interpretable (you can tune later)
+    ctas = ["search", "see", "discover", "learn", "read", "compare", "check", "get", "find", "take a look", "watch"]
+    t = text.lower()
+    for c in ctas:
+        if c in t:
+            # normalize to a single token for reporting
+            return c.replace(" ", "_")
+    return ""
+
+
+def _looks_editorial(headline: str) -> bool:
+    if not headline:
+        return False
+    hl = headline.lower()
+    # light heuristic only (we are NOT filtering rows out)
+    editorial_markers = [
+        "breaking", "live updates", "exclusive", "interview", "debate", "watch:", "video:", "podcast",
+        "nbc news", "cnn", "fox news", "reuters", "ap news",
+    ]
+    return any(m in hl for m in editorial_markers)
+
+
+def _score_row(row: dict) -> int:
+    """
+    Quality score 0-100.
+    We keep all rows. This is only ranking/labeling.
+    """
+    headline = (row.get("headline") or "").strip()
+    network = (row.get("network") or "").strip()
+    dest = (row.get("dest_domain") or "").strip()
+
+    score = 0
+
+    # Network signal
+    if network in ("Taboola", "Outbrain"):
+        score += 30
+    elif network:
+        score += 15
+    else:
+        score += 5
+
+    # Headline length: prefer ad-like (not tiny, not huge)
+    n = len(headline)
+    if 30 <= n <= 110:
+        score += 25
+    elif 20 <= n < 30 or 110 < n <= 160:
+        score += 15
+    elif 12 <= n < 20 or 160 < n <= 220:
+        score += 5
+    else:
+        score += 0
+
+    # CTA present
+    cta = row.get("cta_word") or ""
+    if cta:
+        score += 15
+
+    # Question / urgency patterns
+    if "?" in headline:
+        score += 5
+    if re.search(r"\b(2025|2026|2027)\b", headline):
+        score += 5
+    if re.search(r"\b(cost|price|rates|eligible|paying|save|savings)\b", headline.lower()):
+        score += 5
+
+    # Destination domain present
+    if dest:
+        score += 10
+
+    # Light penalty for likely editorial (still keep it)
+    if _looks_editorial(headline):
+        score -= 15
+
+    # Clamp
+    if score < 0:
+        score = 0
+    if score > 100:
+        score = 100
+    return int(score)
+
+
+def _parse_day_from_blobname(blob_name: str, raw_root: str) -> str:
+    """
+    Expects: <raw_root>/<YYYY-MM-DD>/native_<ts>.csv
+    Returns day or "".
+    """
+    # normalize
+    s = blob_name
+    if not s.startswith(raw_root.rstrip("/") + "/"):
+        return ""
+    parts = s.split("/")
+    # raw_root might include slashes; day is the segment right after raw_root
+    raw_parts = raw_root.strip("/").split("/")
+    if len(parts) < len(raw_parts) + 2:
+        return ""
+    day = parts[len(raw_parts)]
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+        return day
+    return ""
+
+
+def load_raw_for_day(bucket: str, raw_root: str, day: str) -> pd.DataFrame:
+    day_prefix = f"{raw_root.rstrip('/')}/{day}/"
+    blobs = [b for b in _list_blobs(bucket, day_prefix) if b.name.endswith(".csv") and "/native_" in b.name]
+    if not blobs:
+        return pd.DataFrame()
+
+    # read all native_*.csv for the day (supports multiple runs/day)
+    dfs = []
+    for b in sorted(blobs, key=lambda x: x.name):
+        try:
+            txt = b.download_as_text()
+            df = pd.read_csv(io.StringIO(txt))
+            df["raw_blob"] = b.name
+            dfs.append(df)
+        except Exception as e:
+            log.info(f"skip blob read failed blob={b.name} err={e}")
+
+    if not dfs:
+        return pd.DataFrame()
+    out = pd.concat(dfs, ignore_index=True)
+    return out
+
+
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    # Normalize expected columns
+    for col in ["source", "page_url", "network", "headline", "ad_description", "image_url", "original_url", "hash_id", "date_seen", "ts_seen"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["dest_domain"] = df["original_url"].astype(str).apply(_safe_domain)
+    df["dest_path"] = df["original_url"].astype(str).apply(_safe_path)
+    df["source_domain"] = df["page_url"].astype(str).apply(_safe_domain)
+
+    # Keep search engines (you explicitly said you want to see these)
+    search_domains = {"search.yahoo.com", "www.search.yahoo.com", "bing.com", "www.bing.com", "google.com", "www.google.com", "duckduckgo.com", "www.duckduckgo.com"}
+    df["is_search_engine"] = df["dest_domain"].isin({d.replace("www.", "") for d in search_domains}).astype(int)
+
+    # Common arbitrage redirect hints (flag only)
+    def _is_arb(u: str) -> int:
+        s = (u or "").lower()
+        return 1 if any(x in s for x in ("yhs/r", "startsearch", "searchfeed", "trk.", "click.php", "token=")) else 0
+
+    df["is_arb_redirect"] = df["original_url"].astype(str).apply(_is_arb)
+
+    df["cta_word"] = df["headline"].astype(str).apply(_extract_cta_word)
+    df["looks_editorial"] = df["headline"].astype(str).apply(lambda s: 1 if _looks_editorial(s) else 0)
+
+    # Score (row-wise)
+    df["quality_score"] = df.apply(lambda r: _score_row(r.to_dict()), axis=1)
+
+    # Simple “niche hint” tags (flag only; tune later)
+    def _niche(h: str) -> str:
+        t = (h or "").lower()
+        if re.search(r"\b(window|windows|roof|gutter|hvac|garage)\b", t):
+            return "home_services"
+        if re.search(r"\b(cd rates|savings|bank|interest|ira|ss\b|social security)\b", t):
+            return "finance"
+        if re.search(r"\b(car|vehicle|dashcam|warranty)\b", t):
+            return "auto"
+        if re.search(r"\b(weight loss|dementia|edema|serum)\b", t):
+            return "health"
+        if re.search(r"\b(dating|singles)\b", t):
+            return "dating"
+        return "other"
+
+    df["niche_hint"] = df["headline"].astype(str).apply(_niche)
+
+    return df
+
+
+def build_rollup(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Small rollup for UI/search:
+    - top domains
+    - top niches
+    - top headlines (by frequency)
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    # headline frequency (keep headline + dest_domain + network + avg score)
+    g = df.groupby(["headline", "dest_domain", "network"], dropna=False).agg(
+        impressions=("headline", "size"),
+        avg_score=("quality_score", "mean"),
+        any_search=("is_search_engine", "max"),
+        any_arb=("is_arb_redirect", "max"),
+        niche=("niche_hint", lambda x: x.value_counts().index[0] if len(x) else "other"),
+    ).reset_index()
+
+    g["avg_score"] = g["avg_score"].round(1)
+    g = g.sort_values(["impressions", "avg_score"], ascending=[False, False])
+    return g
+
+
+def scan_enriched_days(bucket: str, enriched_root: str, days_back: int) -> pd.DataFrame:
+    """
+    Loads enriched CSVs for last N days by scanning GCS.
+    """
+    blobs = [b for b in _list_blobs(bucket, enriched_root.rstrip("/") + "/") if b.name.endswith(".csv") and "/enriched_" in b.name]
+    if not blobs:
+        return pd.DataFrame()
+
+    # determine which days to include
+    today = utc_now().date()
+    keep_days = {(today - timedelta(days=i)).isoformat() for i in range(days_back)}
+
+    dfs = []
+    for b in blobs:
+        day = _parse_day_from_blobname(b.name, enriched_root)
+        if day and day in keep_days:
+            try:
+                txt = b.download_as_text()
+                dfs.append(pd.read_csv(io.StringIO(txt)))
+            except Exception as e:
+                log.info(f"skip enriched read failed blob={b.name} err={e}")
+
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
+
+# --- add these helpers anywhere above main() ---
+
+def _bq_session():
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    return AuthorizedSession(creds)
+
+def bq_load_append_from_gcs(project: str, dataset: str, table: str, gcs_uri: str):
+    """
+    Appends a GCS CSV into an existing BigQuery table via a LOAD job.
+    """
+    sess = _bq_session()
+    url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/jobs"
+
+    payload = {
+        "configuration": {
+            "load": {
+                "sourceUris": [gcs_uri],
+                "destinationTable": {
+                    "projectId": project,
+                    "datasetId": dataset,
+                    "tableId": table,
+                },
+                "writeDisposition": "WRITE_APPEND",
+                "sourceFormat": "CSV",
+                "skipLeadingRows": 1,
+                "allowQuotedNewlines": True,
+                "allowJaggedRows": True,
+                "ignoreUnknownValues": True,
+                # schema must match your table; this matches ads_enriched_history
+                "schema": {
+                    "fields": [
+                        {"name":"source","type":"STRING"},
+                        {"name":"page_url","type":"STRING"},
+                        {"name":"network","type":"STRING"},
+                        {"name":"headline","type":"STRING"},
+                        {"name":"ad_description","type":"STRING"},
+                        {"name":"image_url","type":"STRING"},
+                        {"name":"original_url","type":"STRING"},
+                        {"name":"hash_id","type":"STRING"},
+                        {"name":"date_seen","type":"DATE"},
+                        {"name":"ts_seen","type":"TIMESTAMP"},
+                        {"name":"hash_recurrence","type":"INTEGER"},
+                        {"name":"raw_blob","type":"STRING"},
+                        {"name":"dest_domain","type":"STRING"},
+                        {"name":"dest_path","type":"STRING"},
+                        {"name":"source_domain","type":"STRING"},
+                        {"name":"is_search_engine","type":"INTEGER"},
+                        {"name":"is_arb_redirect","type":"INTEGER"},
+                        {"name":"cta_word","type":"STRING"},
+                        {"name":"looks_editorial","type":"INTEGER"},
+                        {"name":"quality_score","type":"INTEGER"},
+                        {"name":"niche_hint","type":"STRING"},
+                    ]
+                },
+            }
+        }
+    }
+
+    r = sess.post(url, json=payload, timeout=120)
+    r.raise_for_status()
+    job = r.json()
+    job_id = job["jobReference"]["jobId"]
+    location = job["jobReference"].get("location", "US")
+    status_url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/jobs/{job_id}?location={location}"
+
+    # poll until DONE
+    for _ in range(120):  # up to ~10 min if you keep sleep at 5s
+        js = sess.get(status_url, timeout=60).json()
+        state = js.get("status", {}).get("state")
+        if state == "DONE":
+            err = js.get("status", {}).get("errorResult")
+            if err:
+                raise RuntimeError(f"BigQuery load failed: {err}")
+            return job_id
+        time.sleep(5)
+
+    raise TimeoutError(f"BigQuery load job did not finish: {job_id}")
+
+def bq_query_rollup_csv(project: str, dataset: str, table: str, days: int) -> str:
+    """
+    Returns a CSV string for the rollup over last N days.
+    """
+    sess = _bq_session()
+    url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{project}/queries"
+
+    # last N days inclusive: days=7 => last 7 calendar days including today
+    sql = f"""
+    SELECT
+      headline,
+      dest_domain,
+      network,
+      COUNT(1) AS impressions,
+      ROUND(AVG(quality_score), 1) AS avg_score,
+      MAX(is_search_engine) AS any_search,
+      MAX(is_arb_redirect) AS any_arb,
+      (SELECT x.value FROM UNNEST(APPROX_TOP_COUNT(niche_hint, 1)) x LIMIT 1) AS niche
+    FROM `{project}.{dataset}.{table}`
+    WHERE date_seen >= DATE_SUB(CURRENT_DATE(), INTERVAL {days-1} DAY)
+    GROUP BY headline, dest_domain, network
+    ORDER BY impressions DESC, avg_score DESC
+    """
+
+    payload = {"query": sql, "useLegacySql": False}
+    r = sess.post(url, json=payload, timeout=120)
+    r.raise_for_status()
+    res = r.json()
+
+    fields = [f["name"] for f in res["schema"]["fields"]]
+
+    # BigQuery returns rows as [{"f":[{"v":...}, ...]}]
+    rows = res.get("rows", [])
+    out = io.StringIO()
+    out.write(",".join(fields) + "\n")
+    for row in rows:
+        vals = [c.get("v", "") for c in row.get("f", [])]
+        # naive CSV escaping (good enough for your use since headline can contain commas)
+        esc = []
+        for v in vals:
+            s = "" if v is None else str(v)
+            if any(ch in s for ch in [",", '"', "\n", "\r"]):
+                s = '"' + s.replace('"', '""') + '"'
+            esc.append(s)
+        out.write(",".join(esc) + "\n")
+
+    return out.getvalue()
+
+
+def main():
+    # Required
+    bucket = os.environ.get("BUCKET_NAME", "").strip()
+    if not bucket:
+        print("ERROR: BUCKET_NAME env var required", file=sys.stderr)
+        sys.exit(2)
+
+    raw_root = os.environ.get("RAW_ROOT", "native/daily").strip()
+    enriched_root = os.environ.get("ENRICHED_ROOT", "native_enriched/daily").strip()
+    summaries_root = os.environ.get("SUMMARIES_ROOT", "summaries").strip()
+
+    target_day = os.environ.get("TARGET_DAY", "").strip() or utc_day()
+    run_ts = os.environ.get("RUN_TS", "").strip() or utc_ts_compact()
+
+    log.info(f"enrich start bucket={bucket} target_day={target_day} raw_root={raw_root}")
+
+    raw_df = load_raw_for_day(bucket=bucket, raw_root=raw_root, day=target_day)
+    if raw_df.empty:
+        log.info("enrich: no raw rows found for day; writing empty outputs")
+        enriched_df = pd.DataFrame()
+    else:
+        enriched_df = enrich(raw_df)
+
+    # Write enriched daily output
+    out_blob = f"{enriched_root.rstrip('/')}/{target_day}/enriched_{run_ts}.csv"
+    _write_gcs_bytes(bucket, out_blob, enriched_df.to_csv(index=False).encode("utf-8"), "text/csv")
+
+    # Build + write rollup for the day
+    roll = build_rollup(enriched_df)
+    roll_blob = f"{enriched_root.rstrip('/')}/{target_day}/rollup_{run_ts}.csv"
+    _write_gcs_bytes(bucket, roll_blob, roll.to_csv(index=False).encode("utf-8"), "text/csv")
+
+    # --- BigQuery-backed history + rollups ---
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip() or os.environ.get("GCP_PROJECT", "").strip()
+    if not project:
+        project = os.environ.get("PROJECT_ID", "").strip()
+
+    bq_dataset = os.environ.get("BQ_DATASET", "arb_native_intel").strip()
+    bq_table = os.environ.get("BQ_TABLE", "ads_enriched_history").strip()
+
+    # Append this run’s enriched file into BigQuery
+    gcs_enriched_uri = f"gs://{bucket}/{out_blob}"
+    log.info(f"bq append start uri={gcs_enriched_uri} table={project}.{bq_dataset}.{bq_table}")
+    bq_job_id = bq_load_append_from_gcs(project, bq_dataset, bq_table, gcs_enriched_uri)
+    log.info(f"bq append done job_id={bq_job_id}")
+
+    # Build 7d + 30d rollups from BigQuery (not by scanning daily files)
+    sum7_csv = bq_query_rollup_csv(project, bq_dataset, bq_table, days=7)
+    sum30_csv = bq_query_rollup_csv(project, bq_dataset, bq_table, days=30)
+
+    _write_gcs_bytes(bucket, f"{summaries_root.rstrip('/')}/last_7_days.csv", sum7_csv.encode("utf-8"), "text/csv")
+    _write_gcs_bytes(bucket, f"{summaries_root.rstrip('/')}/last_30_days.csv", sum30_csv.encode("utf-8"), "text/csv")
+
+    # Lightweight state marker
+    state = {
+        "status": "done",
+        "target_day": target_day,
+        "run_ts": run_ts,
+        "raw_rows": int(len(raw_df)) if not raw_df.empty else 0,
+        "enriched_rows": int(len(enriched_df)) if not enriched_df.empty else 0,
+        "gcs_enriched": f"gs://{bucket}/{out_blob}",
+        "gcs_rollup": f"gs://{bucket}/{roll_blob}",
+        "gcs_sum7": f"gs://{bucket}/{summaries_root.rstrip('/')}/last_7_days.csv",
+        "gcs_sum30": f"gs://{bucket}/{summaries_root.rstrip('/')}/last_30_days.csv",
+    }
+    _write_gcs_bytes(bucket, f"{summaries_root.rstrip('/')}/enricher_last_run.json", json.dumps(state, indent=2).encode("utf-8"), "application/json")
+
+    # --- NEW: History + Latest outputs ---
+    history_blob = "native_enriched/history/ads_history.csv"
+    latest_ads_blob = "native_enriched/latest/ads_latest.csv"
+    latest_rollup_blob = "native_enriched/latest/rollup_latest.csv"
+
+    # 1) Latest snapshots (overwrite)
+    _write_gcs_bytes(bucket, latest_ads_blob, enriched_df.to_csv(index=False).encode("utf-8"), "text/csv")
+    _write_gcs_bytes(bucket, latest_rollup_blob, roll.to_csv(index=False).encode("utf-8"), "text/csv")
+
+    # 2) Append-only history
+    hb = _gcs_client().bucket(bucket).blob(history_blob)
+    if hb.exists():
+        gcs_append_csv(bucket, history_blob, enriched_df.to_csv(index=False, header=False))
+    else:
+        gcs_append_csv(bucket, history_blob, enriched_df.to_csv(index=False, header=True))
+
+    log.info(f"enrich done enriched_rows={state['enriched_rows']} out={state['gcs_enriched']}")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()

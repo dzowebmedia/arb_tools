@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+playwright==1.49.0
+beautifulsoup4==4.12.3
+pyyaml==6.0.2
+pandas==2.2.3
+google-cloud-storage==2.18.2
